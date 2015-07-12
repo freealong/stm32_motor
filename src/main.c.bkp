@@ -1,0 +1,362 @@
+/*********************************************************************************
+  * @file    main.c 
+  * @author  Yongqi Lee 
+  * @version V1.0 
+  * @date    08-Aguest-2014
+  * @brief   Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * THE PRESENT FIRMWARE WHICH IS FOR GUIDANCE ONLY AIMS AT PROVIDING CUSTOMERS
+  * WITH CODING INFORMATION REGARDING THEIR PRODUCTS IN ORDER FOR THEM TO SAVE
+  * TIME. AS A RESULT, STMICROELECTRONICS SHALL NOT BE HELD LIABLE FOR ANY
+  * DIRECT, INDIRECT OR CONSEQUENTIAL DAMAGES WITH RESPECT TO ANY CLAIMS ARISING
+  * FROM THE CONTENT OF SUCH FIRMWARE AND/OR THE USE MADE BY CUSTOMERS OF THE
+  * CODING INFORMATION CONTAINED HEREIN IN CONNECTION WITH THEIR PRODUCTS.
+  *
+  * <h2><center>&copy; COPYRIGHT 2011 STMicroelectronics</center></h2>
+  ******************************************************************************/  
+
+/* Includes ------------------------------------------------------------------*/
+#include "stm32f10x.h"
+#include "stm32f10x_rcc.h"
+#include "stm32f10x_tim.h"
+#include "stm32f10x_gpio.h"
+#include "stm32f10x_usart.h"
+#include "misc.h"
+
+/* Definitions */
+#define ENCODER_PPR	(u16)(400)   // number of pulses per revolution
+#define SPEED_BUFFER_SIZE 5 
+#define SPEED_SAMPLE_FREQUENCY 500
+#define SPEED_MAX 200
+#define TIM_PERIOD 1000 
+
+/* initial functins */ 
+void RCC_Configure(void);
+void GPIO_Configure(void);
+void TIM_Configure(void);
+void NVIC_Configuare(void);
+void USART_Configure(void);
+
+s16 get_speed(void);
+void adjust_speed(s16 uk);
+void updata_speed_buf(void);
+s16 filter_speed(void);
+u8 hex2ascll(s16 number, u8* string);
+
+/* extern variable */
+extern u16 flag_1ms,flag_2ms,flag_10ms,flag_100ms;
+extern u16 overflow;
+
+s16 set_speed=0,actual_speed=0,speed_buf[SPEED_BUFFER_SIZE];
+u16 counter_sample_one=0,counter_sample_two=0;
+float error=0,error1=0,error2=0;
+float kp=0,ki=0,kd=0;
+s16 uk=0,delta_uk=0;
+u8 send_buf[4]={0x30,0x30,0x30,0x30},receive_buf[4]={0x30,0x30,0x30,0x30};
+u8 num=0,i=0,rx_finish=0;
+
+int main(void)
+{
+	SystemInit();
+	RCC_ClockSecuritySystemCmd(ENABLE);
+	RCC_Configure();
+	GPIO_Configure();
+	TIM_Configure();
+	USART_Configure();
+	NVIC_Configuare();
+
+	while(1)
+	{
+		if(flag_1ms == 1)
+		{
+			flag_1ms = 0;
+		}	
+
+		if(flag_2ms == 1)
+		{
+			flag_2ms = 0;
+			updata_speed_buf();
+		}
+    
+		if(flag_10ms == 1)
+		{
+			flag_10ms = 0;
+			
+			error2 = error1;
+			error1 = error;
+			actual_speed = filter_speed();
+			error = set_speed - actual_speed;
+
+			kp = 6.0;
+			ki = 0.2;
+			kd = 0.1;
+
+			delta_uk = kp * (error - error1) + ki * error +kd * (error- 2 * error1 +error2);
+			uk += delta_uk;
+
+			if(uk>TIM_PERIOD)
+				uk = TIM_PERIOD;
+			else if(uk<-TIM_PERIOD)
+				uk = -TIM_PERIOD;
+
+			adjust_speed(uk);
+			
+		}
+		
+		if(flag_100ms==1)
+		{
+			flag_100ms=0;
+
+			// RS232 sent
+			num = hex2ascll(actual_speed, send_buf);
+			for(i=num;i>0;i--)
+			{
+				USART_SendData(USART1, send_buf[i-1]); //sent
+				while(USART_GetFlagStatus(USART1, USART_FLAG_TXE) == RESET){} //wait sent finished
+			}
+			USART_SendData(USART1, ' '); //sent
+			while(USART_GetFlagStatus(USART1, USART_FLAG_TXE) == RESET){} //wait sent finished
+
+			//LED blink
+			if(error>50 || error<-50)
+				GPIO_WriteBit(GPIOB,GPIO_Pin_5,Bit_SET);
+			else
+				GPIO_WriteBit(GPIOB,GPIO_Pin_5,Bit_RESET);
+		}//end of 500ms
+	}//end of while(1)
+}//end of main
+
+void RCC_Configure(void)
+{
+	RCC_APB2PeriphClockCmd(RCC_APB2Periph_AFIO, ENABLE);
+	RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
+	RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);
+	RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM2, ENABLE);
+	RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM3, ENABLE);
+	RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM5, ENABLE);
+	RCC_APB2PeriphClockCmd(RCC_APB2Periph_USART1, ENABLE);
+}
+
+void GPIO_Configure(void)
+{
+	GPIO_InitTypeDef GPIO_InitStructure;
+
+	/* Led PB5 configure */
+	GPIO_InitStructure.GPIO_Pin = GPIO_Pin_5; 
+	GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz; 
+	GPIO_InitStructure.GPIO_Mode = GPIO_Mode_Out_PP;
+	GPIO_Init(GPIOB, &GPIO_InitStructure);
+
+	/* PWM, TIM2, CH3 CH4,  PB10 PB11 configure */
+	GPIO_InitStructure.GPIO_Pin = GPIO_Pin_10|GPIO_Pin_11;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AF_PP;
+	GPIO_Init(GPIOB, &GPIO_InitStructure);
+	GPIO_PinRemapConfig(GPIO_FullRemap_TIM2, ENABLE);
+
+	/* Counter, TIM5 CH1 CH2,  PA0 PA1 configure */
+	GPIO_InitStructure.GPIO_Pin = GPIO_Pin_0|GPIO_Pin_1;
+	GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IN_FLOATING;
+	GPIO_Init(GPIOA, &GPIO_InitStructure);
+
+	/* RS232, USART1 TX RX, PA9 PA10 configure */
+	GPIO_InitStructure.GPIO_Pin = GPIO_Pin_9;
+	GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AF_PP;
+	GPIO_Init(GPIOA, &GPIO_InitStructure);
+
+	GPIO_InitStructure.GPIO_Pin = GPIO_Pin_10;
+	GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IN_FLOATING;
+	GPIO_Init(GPIOA, &GPIO_InitStructure);
+}
+
+void TIM_Configure(void)
+{
+	TIM_TimeBaseInitTypeDef TIM_TimeBaseStructure;
+	TIM_OCInitTypeDef TIM_OCInitStructure;
+	TIM_ICInitTypeDef TIM_ICInitStructure;
+
+	/* PWM TIM2 configure */
+	TIM_TimeBaseStructure.TIM_Period = TIM_PERIOD;
+	TIM_TimeBaseStructure.TIM_Prescaler = (u16) (SystemCoreClock / 10000000) - 1;
+	TIM_TimeBaseStructure.TIM_ClockDivision = 0;
+	TIM_TimeBaseStructure.TIM_CounterMode = TIM_CounterMode_Up;
+	TIM_TimeBaseInit(TIM2, &TIM_TimeBaseStructure);
+	/* CH3 */
+	TIM_OCInitStructure.TIM_OCMode = TIM_OCMode_PWM1;
+	TIM_OCInitStructure.TIM_OutputState = TIM_OutputState_Enable;
+	TIM_OCInitStructure.TIM_OCPolarity = TIM_OCPolarity_High;
+	TIM_OCInitStructure.TIM_Pulse = 0;
+	TIM_OC3Init(TIM2, &TIM_OCInitStructure);
+	TIM_OC1PreloadConfig(TIM2, TIM_OCPreload_Enable);
+	/* CH4 */
+	TIM_OCInitStructure.TIM_OutputState = TIM_OutputState_Enable;
+	TIM_OCInitStructure.TIM_Pulse = 0;
+	TIM_OC4Init(TIM2, &TIM_OCInitStructure);
+	/* ENABLE */
+	TIM_Cmd(TIM2, ENABLE);
+	
+    /* INT TIM3 configure */
+    TIM_TimeBaseStructure.TIM_Period = 10;
+    TIM_TimeBaseStructure.TIM_Prescaler =(7200-1);
+    TIM_TimeBaseInit(TIM3, &TIM_TimeBaseStructure);
+    TIM_ITConfig(TIM3,TIM_IT_Update|TIM_IT_Trigger,ENABLE);
+    TIM_Cmd(TIM3, ENABLE);
+
+    /* ENCODER TIM5 configure */
+    TIM_DeInit(TIM5);
+    TIM_TimeBaseStructInit(&TIM_TimeBaseStructure);
+    TIM_TimeBaseStructure.TIM_Period = 0xffff;
+    TIM_TimeBaseStructure.TIM_Prescaler = 0;
+    TIM_TimeBaseStructure.TIM_ClockDivision = TIM_CKD_DIV1;
+    TIM_TimeBaseStructure.TIM_CounterMode = TIM_CounterMode_Up;
+    TIM_TimeBaseInit(TIM5, &TIM_TimeBaseStructure);
+    TIM_EncoderInterfaceConfig(TIM5, TIM_EncoderMode_TI12, TIM_ICPolarity_Rising, TIM_ICPolarity_Rising);
+    TIM_ICStructInit(&TIM_ICInitStructure);
+    TIM_ICInitStructure.TIM_ICFilter = 6;
+    TIM_ICInit(TIM5, &TIM_ICInitStructure);
+    TIM_ITConfig(TIM5,TIM_IT_Update|TIM_IT_Trigger,ENABLE);
+    TIM_Cmd(TIM5, ENABLE);
+}
+
+void NVIC_Configuare(void)
+{
+    NVIC_InitTypeDef   NVIC_InitStructure;
+   // NVIC_SetVectorTable(NVIC_VectTab_FLASH,0x0);
+    NVIC_PriorityGroupConfig(NVIC_PriorityGroup_0);
+
+    NVIC_InitStructure.NVIC_IRQChannel=TIM3_IRQn;
+    NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority=0x0F;   
+    NVIC_InitStructure.NVIC_IRQChannelSubPriority=0x0F;       
+    NVIC_InitStructure.NVIC_IRQChannelCmd=ENABLE;
+    NVIC_Init(&NVIC_InitStructure);
+
+    NVIC_InitStructure.NVIC_IRQChannel = TIM5_IRQn;
+  //  NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 1;
+    NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;
+    NVIC_Init(&NVIC_InitStructure);
+
+    NVIC_InitStructure.NVIC_IRQChannel = USART1_IRQn;
+    NVIC_InitStructure.NVIC_IRQChannelSubPriority = 1;
+    NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;
+    NVIC_Init(&NVIC_InitStructure);
+}
+
+void USART_Configure(void)
+{
+	USART_InitTypeDef USART_InitStructure;
+	USART_InitStructure.USART_BaudRate = 9600;
+	USART_InitStructure.USART_WordLength = USART_WordLength_8b;
+	USART_InitStructure.USART_StopBits = USART_StopBits_1;
+	USART_InitStructure.USART_Parity = USART_Parity_No;
+	USART_InitStructure.USART_HardwareFlowControl = USART_HardwareFlowControl_None;
+	USART_InitStructure.USART_Mode = USART_Mode_Rx | USART_Mode_Tx;
+	USART_Init(USART1, &USART_InitStructure);
+	USART_ITConfig(USART1, USART_IT_RXNE, ENABLE);
+	USART_Cmd(USART1, ENABLE);
+}
+
+s16 get_speed(void)
+{
+	s32 impluse=0;
+	s16 speed_temp=0;
+
+    counter_sample_two = counter_sample_one;
+    counter_sample_one = TIM5->CNT;
+
+    if ( (TIM5->CR1 & TIM_CounterMode_Down) == TIM_CounterMode_Down)
+    {// encoder timer down-counting
+    	impluse = (s32)(counter_sample_one) - (s32)(counter_sample_two) - (s32)(overflow * 65536);
+    }
+    else
+    {//encoder timer up-counting
+    	impluse = (s32)(counter_sample_one) - (s32)(counter_sample_two) + (s32)(overflow * 65536);
+    }
+	overflow = 0;
+
+	speed_temp = (float)(impluse)*SPEED_SAMPLE_FREQUENCY/(float)(4*ENCODER_PPR);
+	return speed_temp;
+}
+
+void adjust_speed(s16 uk)
+{
+	if(uk>0)
+	{
+		TIM2->CCR3 = uk;
+		TIM2->CCR4 = 0;
+	}
+	else
+	{
+		TIM2->CCR3 = 0;
+		TIM2->CCR4 = -uk;
+	}
+}
+
+void updata_speed_buf(void)
+{
+	s8 i=0;
+	for(i=SPEED_BUFFER_SIZE-1; i>0; i--)
+	{
+		speed_buf[i]=speed_buf[i-1];
+	}
+	speed_buf[0] = get_speed();
+}
+
+s16 filter_speed(void)
+{
+	s8 i=0,j=0;
+	s16 tmp=0;
+	s16 *tmp_buf=speed_buf;
+	for(i=0; i<SPEED_BUFFER_SIZE; i++)
+	{
+		for(j=i; j<SPEED_BUFFER_SIZE; j++)
+			if(tmp_buf[i]>tmp_buf[j])
+			{
+				tmp = tmp_buf[i];
+				tmp_buf[i] = tmp_buf[j];
+				tmp_buf[j] = tmp;
+			}
+	}
+	tmp = 0;
+	for(i=1; i<SPEED_BUFFER_SIZE-1; i++)
+		tmp+=tmp_buf[i];
+	tmp=(float)(tmp)/(float)(SPEED_BUFFER_SIZE-2);
+	return tmp;
+}
+
+u8 hex2ascll(s16 number, u8* string)
+{
+	u16 temp=0;
+	u8 i=0;
+	string[0]=0x30;string[1]=0x30;string[2]=0x30;string[3]=0x30;
+	if(number==0)
+	{
+		i++;
+		return i;
+	}
+	else if(number>0)
+	{
+		while(number!=0)
+		{
+			temp=number%10;
+			string[i]=temp+0x30;
+			number=number/10;
+			i++;
+		}
+		return i;
+	}
+	else
+	{
+		number=-number;
+		while(number!=0)
+		{
+			temp=number%10;
+			string[i]=temp+0x30;
+			number=number/10;
+			i++;
+		}
+		string[i]=0x2d;
+		i++;
+		return i;
+	}
+}
